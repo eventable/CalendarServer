@@ -1,0 +1,179 @@
+#!/bin/sh
+# -*- sh-basic-offset: 2 -*-
+
+##
+# Copyright (c) 2005-2015 Apple Inc. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+##
+
+##
+# WARNING: This script is intended for use by developers working on
+# the Calendar Server code base.  It is not intended for use in a
+# deployment configuration.
+#
+# DO NOT use this script as a system startup tool (eg. in /etc/init.d,
+# /Library/StartupItems, launchd plists, etc.)
+#
+# For those uses, install the server properly (eg. with "./run -i
+# /tmp/foo && cd /tmp/foo && pax -pe -rvw . /") and use the caldavd
+# executable to start the server.
+##
+
+set -e;
+set -u;
+
+wd="$(cd "$(dirname "$0")/.." && pwd)";
+
+
+#
+# Usage
+#
+
+clean="false";
+
+usage () {
+  program="$(basename "$0")";
+
+  if [ "${1--}" != "-" ]; then
+    echo "$@";
+    echo;
+  fi;
+
+  echo "Usage: ${program} [-hFfn] destination";
+  echo "Options:";
+  echo "  -h  Print this help and exit";
+  echo "  -F  Clean and force setup to run";
+  echo "  -f  Force setup to run";
+  echo "  -n  Do not run setup";
+
+  if [ "${1-}" = "-" ]; then
+    return 0;
+  fi;
+  exit 64;
+}
+
+
+parse_options () {
+  local OPTIND=1;
+  while getopts "hFfn" option; do
+    case "${option}" in
+      '?') usage; ;;
+      'h') usage -; exit 0; ;;
+      'F') do_setup="true" ; force_setup="true" ; clean="true" ; ;;
+      'f') do_setup="true" ; force_setup="true" ; clean="false"; ;;
+      'n') do_setup="false"; force_setup="false"; clean="false"; ;;
+    esac;
+  done;
+  shift $((${OPTIND} - 1));
+
+  if [ $# -le 0 ]; then
+    usage "No desination provided.";
+  fi;
+  destination="$1"; shift;
+
+  if [ $# != 0 ]; then
+    usage "Unrecognized arguments:" "$@";
+  fi;
+}
+
+
+main () {
+  . "${wd}/bin/_build.sh";
+
+  parse_options "$@";
+
+  #
+  # Build everything
+  #
+
+  if "${clean}"; then
+    develop_clean;
+  fi;
+
+  install -d "${destination}";
+  local destination="$(cd "${destination}" && pwd)";
+
+  init_build;
+
+      dev_roots="${destination}/roots";
+  py_virtualenv="${destination}/virtualenv";
+      py_bindir="${py_virtualenv}/bin";
+    py_ve_tools="${dev_home}/ve_tools";
+
+  if [ ! -d "${py_virtualenv}" ]; then
+    bootstrap_virtualenv;
+    "${bootstrap_python}" -m virtualenv  \
+      --always-copy                      \
+      --system-site-packages             \
+      --no-setuptools                    \
+      "${py_virtualenv}";
+  fi;
+
+  c_dependencies;
+  py_dependencies;
+
+  install -d "${destination}/bin";
+  install -d "${destination}/lib";
+
+  cd "${destination}/bin";
+
+  find ../virtualenv/bin                                                   \
+    "(" -name "caldavd" -o -name 'calendarserver_*' -o -name "python" ")"  \
+    -exec ln -fs "{}" . ";"                                                \
+    ;
+
+  for executable in              \
+    "memcached/bin/memcached"    \
+    "OpenLDAP/bin/ldapsearch"    \
+    "openssl/bin/openssl"        \
+    "PostgreSQL/bin/initdb"      \
+    "PostgreSQL/bin/pg_ctl"      \
+    "PostgreSQL/bin/psql"        \
+  ; do
+    if [ -e "../roots/${executable}" ]; then
+      ln -s "../roots/${executable}" .;
+    else
+      echo "No executable: ${executable}";
+    fi;
+  done;
+
+  cd "${destination}/lib";
+
+  find "../roots" "(" -type f -o -type l ")"  \
+    "("                    \
+      -name '*.so'     -o  \
+      -name '*.so.*'   -o  \
+      -name '*.dylib'      \
+    ")" -print0            \
+    | xargs -0 -I % ln -s % .;
+
+  # Write out environment.sh
+  local dst="${destination}";
+  cat > "${dst}/environment.sh" << __EOF__
+export              PATH="${dst}/bin:\${PATH}";
+export    C_INCLUDE_PATH="${dst}/include:\${C_INCLUDE_PATH:-}";
+export   LD_LIBRARY_PATH="${dst}/lib:${dst}/lib64:\${LD_LIBRARY_PATH:-}:\$ORACLE_HOME";
+export          CPPFLAGS="-I${dst}/include \${CPPFLAGS:-} ";
+export           LDFLAGS="-L${dst}/lib -L${dst}/lib64 \${LDFLAGS:-} ";
+export DYLD_LIBRARY_PATH="${dst}/lib:${dst}/lib64:\${DYLD_LIBRARY_PATH:-}:\$ORACLE_HOME";
+__EOF__
+
+  # Install CalendarServer into venv
+  cd ${wd}
+  ${python} setup.py install
+
+}
+
+
+main "$@";
